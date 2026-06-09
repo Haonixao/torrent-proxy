@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -152,7 +155,7 @@ func handleTorrentConn(conn net.Conn) {
 		rand.Read(respHandshake[56:68])
 		conn.Write(respHandshake)
 
-		handleSess(conn)
+		handleSess(conn, nonce)
 	} else {
 		// Foreign Client - Decoy Mode
 		beRealTorrentPeer(conn, clientInfoHash)
@@ -227,7 +230,7 @@ func beRealTorrentPeer(conn net.Conn, infoHash []byte) {
 	}
 }
 
-func handleSess(conn net.Conn) {
+func handleSess(conn net.Conn, nonce []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Panic] handleSess from %s: %v", conn.RemoteAddr(), r)
@@ -249,7 +252,7 @@ func handleSess(conn net.Conn) {
 	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
 
 	// Wrap connection with piece framing
-	tConn := NewTorrentConn(conn)
+	tConn := NewTorrentConn(conn, gAuthKey, gInfoHash, nonce)
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
@@ -474,13 +477,28 @@ type TorrentConn struct {
 	remainingPadding int
 	flushTimer       *time.Timer
 	mu               sync.Mutex
+	enc              cipher.Stream
+	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
 	}
+
+	// Initialize AES-CTR for light payload encryption
+	key := sha256.Sum256(authKey)
+	ivSeed := append(nonce, infoHash[:]...)
+	iv := sha256.Sum256(ivSeed)
+
+	block, err := aes.NewCipher(key[:])
+	if err == nil {
+		// Server swap: enc/dec are reversed relative to client
+		tc.enc = cipher.NewCTR(block, iv[16:32])
+		tc.dec = cipher.NewCTR(block, iv[:16])
+	}
+
 	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
 	return tc
 }
@@ -503,6 +521,9 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			n, err = c.reader.Read(p[:toRead])
 			if err != nil {
 				return n, err
+			}
+			if c.dec != nil {
+				c.dec.XORKeyStream(p[:n], p[:n])
 			}
 			c.remainingPayload -= n
 			return n, nil
@@ -589,7 +610,11 @@ func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	binary.BigEndian.PutUint32(buf[9:13], uint32(mrand.Int31n(131072)))
 
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(p)))
-	copy(buf[15:], p)
+	if c.enc != nil {
+		c.enc.XORKeyStream(buf[15:15+len(p)], p)
+	} else {
+		copy(buf[15:], p)
+	}
 
 	if padLen > 0 {
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])

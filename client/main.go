@@ -6,9 +6,12 @@ import (
 	"client/decoy"
 	"client/share"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -484,7 +487,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	}
 
 	// 2. Send BitTorrent Handshake with HMAC
-	peerID := generatePeerID()
+	peerID, nonce := generatePeerID()
 	handshake := make([]byte, handshakeLen)
 	handshake[0] = pstrlen
 	copy(handshake[1:20], pstr)
@@ -516,7 +519,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.LogOutput = io.Discard
 
-	sess, err := yamux.Client(NewTorrentConn(s), muxCfg)
+	sess, err := yamux.Client(NewTorrentConn(s, gAuthKey, gInfoHash, nonce), muxCfg)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -575,7 +578,7 @@ func dropSession(s *yamux.Session) {
 	}
 }
 
-func generatePeerID() [20]byte {
+func generatePeerID() ([20]byte, []byte) {
 	var pid [20]byte
 	copy(pid[:8], []byte("-TR4000-"))
 	nonce := make([]byte, 4)
@@ -586,7 +589,7 @@ func generatePeerID() [20]byte {
 	mac.Write(gInfoHash[:])
 	sig := mac.Sum(nil)[:8]
 	copy(pid[12:20], sig)
-	return pid
+	return pid, nonce
 }
 
 type TorrentConn struct {
@@ -597,13 +600,29 @@ type TorrentConn struct {
 	remainingPadding int
 	flushTimer       *time.Timer
 	mu               sync.Mutex
+	enc              cipher.Stream
+	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
 	}
+
+	// Initialize AES-CTR for light payload encryption
+	// Key = SHA256(AuthKey)
+	// IV = SHA256(nonce + InfoHash)[:16]
+	key := sha256.Sum256(authKey)
+	ivSeed := append(nonce, infoHash[:]...)
+	iv := sha256.Sum256(ivSeed)
+
+	block, err := aes.NewCipher(key[:])
+	if err == nil {
+		tc.enc = cipher.NewCTR(block, iv[:16])
+		tc.dec = cipher.NewCTR(block, iv[16:32]) // Use second half of SHA256 for symmetry
+	}
+
 	// Оборачиваем запись в буфер для снижения оверхеда паддинга
 	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
 	return tc
@@ -631,6 +650,9 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			n, err = c.reader.Read(p[:toRead])
 			if err != nil {
 				return n, err
+			}
+			if c.dec != nil {
+				c.dec.XORKeyStream(p[:n], p[:n])
 			}
 			c.remainingPayload -= n
 			return n, nil
@@ -730,7 +752,11 @@ func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	binary.BigEndian.PutUint32(buf[5:9], uint32(mrand.Int31n(1000)))
 	binary.BigEndian.PutUint32(buf[9:13], uint32(mrand.Int31n(131072)))
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(p)))
-	copy(buf[15:], p)
+	if c.enc != nil {
+		c.enc.XORKeyStream(buf[15:15+len(p)], p)
+	} else {
+		copy(buf[15:], p)
+	}
 
 	if padLen > 0 {
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])
@@ -749,7 +775,7 @@ func startWhiteNoise(ctx context.Context) {
 		"udp://open.stealth.si:80/announce",
 	}
 
-	peerID := generatePeerID()
+	peerID, _ := generatePeerID()
 
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
