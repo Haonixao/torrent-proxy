@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"client/config"
-	"client/decoy"
 	"client/share"
 	"context"
 	"crypto/aes"
@@ -64,11 +63,6 @@ func main() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	if cfg.DecoyTraffic {
-		log.Printf("[INFO] Decoy traffic: enabled")
-		go decoy.StartGlobalDecoy(ctx)
-	}
 
 	go func() {
 		quit := make(chan os.Signal, 1)
